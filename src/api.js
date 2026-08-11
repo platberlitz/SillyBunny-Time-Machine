@@ -8,14 +8,26 @@
  * SillyBunny backs any of them up — only chats and settings.json have backups.
  * So this extension captures those three itself.
  *
- * Agents, tags and every other extension's settings DO live in settings.json,
- * which the server copies into the backup folder whenever it changes, at most
- * once every ten minutes, keeping fifty deduplicated copies. Capturing those
- * again would be work the host has already done, so for those this reads the
- * host's own backups and puts one piece back out of them.
+ * Extension settings live in settings.json, which the server copies into its
+ * backup folder. For those this reads the host's own backups and puts one safe
+ * extension-owned block back without replacing the whole settings file.
  */
-import { cardFromCharacter, restorePayload } from './core.js';
-import { getSettings, save } from './store.js';
+import { cardFromCharacter, isPlainObject, restorePayload } from './core.js';
+import { commitSettings, getSettings, MODULE_NAME, save } from './store.js';
+
+const RESERVED_EXTENSION_KEYS = new Set([
+    MODULE_NAME,
+    '__proto__',
+    'prototype',
+    'constructor',
+    'attachments',
+    'character_attachments',
+    'disabledExtensions',
+]);
+
+const captureSuppressions = new Map();
+const PRESET_CHANGE_APIS = new Set(['kobold', 'novel', 'openai', 'textgenerationwebui']);
+const NAMED_PRESET_APIS = new Set(['instruct', 'context', 'sysprompt', 'reasoning']);
 
 function ctx() {
     return globalThis.SillyTavern.getContext();
@@ -28,9 +40,78 @@ async function post(url, body) {
         body: JSON.stringify(body),
     });
     if (!response.ok) {
-        throw new Error(`${url} responded ${response.status}`);
+        const error = new Error(`${url} responded ${response.status}`);
+        error.status = response.status;
+        throw error;
     }
     return response;
+}
+
+function captureKey(kind, target) {
+    return `${kind}:${target}`;
+}
+
+function isCaptureSuppressed(kind, target) {
+    return captureSuppressions.has(captureKey(kind, target));
+}
+
+async function suppressCapture(kind, target, action) {
+    const key = captureKey(kind, target);
+    captureSuppressions.set(key, (captureSuppressions.get(key) ?? 0) + 1);
+    try {
+        return await action();
+    } finally {
+        const remaining = captureSuppressions.get(key) - 1;
+        if (remaining > 0) {
+            captureSuppressions.set(key, remaining);
+        } else {
+            captureSuppressions.delete(key);
+        }
+    }
+}
+
+function waitForPresetChange(apiId) {
+    const context = ctx();
+    const type = context.eventTypes?.PRESET_CHANGED;
+    if (!type || !PRESET_CHANGE_APIS.has(apiId)) {
+        return { promise: Promise.resolve(), cancel() {} };
+    }
+    let timer;
+    let listener;
+    let finish;
+    const promise = new Promise(resolve => {
+        let finished = false;
+        finish = () => {
+            if (finished) {
+                return;
+            }
+            finished = true;
+            clearTimeout(timer);
+            context.eventSource.removeListener(type, listener);
+            resolve();
+        };
+        listener = (data = {}) => {
+            if (data.apiId === apiId) {
+                finish();
+            }
+        };
+        context.eventSource.on(type, listener);
+        timer = setTimeout(finish, 10_000);
+    });
+    return {
+        promise,
+        cancel: finish,
+    };
+}
+
+function partialRestore(error) {
+    const failure = error instanceof Error ? error : new Error(String(error));
+    failure.partial = true;
+    return failure;
+}
+
+function isRestorableExtensionBlock(key, value) {
+    return typeof key === 'string' && !RESERVED_EXTENSION_KEYS.has(key) && isPlainObject(value);
 }
 
 // ---------------------------------------------------------------- capture ---
@@ -39,45 +120,54 @@ async function post(url, body) {
  * @param {string} avatar the character's avatar filename, which is its identity
  *   everywhere: chats, tags, and the last-chat sidecar are all keyed to it.
  */
-export async function captureCharacter(avatar) {
-    if (!getSettings().captureCharacters) {
+export async function captureCharacter(avatar, { force = false } = {}) {
+    if (isCaptureSuppressed('character', avatar) || (!force && !getSettings().captureCharacters)) {
         return null;
     }
-    const live = ctx().characters ?? [];
+    const context = ctx();
+    const live = context.characters ?? [];
     const index = live.findIndex(character => character?.avatar === avatar);
     if (index === -1) {
         return null;
     }
     // A shallow entry has no definitions at all, so snapshotting one would store
     // an empty description as though the user had cleared it.
-    await ctx().unshallowCharacter(index);
-    const card = cardFromCharacter(live[index]);
-    if (!card) {
+    await context.unshallowCharacter(index);
+    const character = (context.characters ?? []).find(item => item?.avatar === avatar);
+    const card = cardFromCharacter(character);
+    if (!character || !card) {
         return null;
+    }
+    const tags = context.tagMap?.[avatar] ?? [];
+    if (!Array.isArray(tags) || tags.some(tag => typeof tag !== 'string')) {
+        throw new Error(`SillyBunny returned malformed tags for ${avatar}`);
     }
 
     return save({
         kind: 'character',
         target: avatar,
-        label: live[index].name || avatar,
+        label: character.name || avatar,
         data: card,
         // Tags are not in the card. They live in settings.json keyed by avatar
         // and are deleted outright when a character is, so a restored card
         // without them comes back untagged.
-        extra: { tags: structuredClone(ctx().tagMap?.[avatar] ?? []) },
+        extra: { tags: structuredClone(tags) },
     });
 }
 
-export async function captureLorebook(name, data) {
-    if (!getSettings().captureLorebooks) {
+export async function captureLorebook(name, data, { force = false } = {}) {
+    if (isCaptureSuppressed('lorebook', name) || (!force && !getSettings().captureLorebooks)) {
         return null;
     }
     // The whole book object, not a rebuild from `entries`: it also carries
     // originalData, which the host uses to write entries back in their source
     // form. Reconstructing the book would quietly drop it.
-    const book = data ?? await ctx().loadWorldInfo(name);
+    const book = data ?? await liveLorebook(name);
     if (!book) {
         return null;
+    }
+    if (!isPlainObject(book)) {
+        throw new Error(`SillyBunny returned a malformed lorebook for ${name}`);
     }
     return save({ kind: 'lorebook', target: name, label: name, data: structuredClone(book) });
 }
@@ -114,7 +204,7 @@ export async function readAllPresets() {
             const body = bodies[index];
             try {
                 const preset = typeof body === 'string' ? JSON.parse(body) : body;
-                if (preset && typeof preset === 'object') {
+                if (typeof name === 'string' && isPlainObject(preset)) {
                     presets.push({ apiId, name, preset });
                 }
             } catch {
@@ -126,7 +216,7 @@ export async function readAllPresets() {
 
     for (const apiId of ['instruct', 'context', 'sysprompt', 'reasoning']) {
         for (const preset of settings?.[apiId] ?? []) {
-            if (preset && typeof preset === 'object' && typeof preset.name === 'string') {
+            if (isPlainObject(preset) && typeof preset.name === 'string') {
                 presets.push({ apiId, name: preset.name, preset });
             }
         }
@@ -144,23 +234,32 @@ export async function readAllPresets() {
  * preset switch, and the manual button) and leans on hashing: a sweep where
  * nothing changed stores nothing and costs one local request.
  */
-export async function capturePresets() {
-    if (!getSettings().capturePresets) {
-        return 0;
+export async function capturePresets({ force = false } = {}) {
+    const result = { taken: 0, skipped: 0, failed: 0 };
+    if (!force && !getSettings().capturePresets) {
+        return result;
     }
-    let taken = 0;
+    const suppressedAtStart = new Set(captureSuppressions.keys());
     for (const { apiId, name, preset } of await readAllPresets()) {
-        const row = await save({
-            kind: 'preset',
-            target: `${apiId}/${name}`,
-            label: `${name} (${apiId})`,
-            data: preset,
-        });
-        if (row) {
-            taken++;
+        const key = captureKey('preset', `${apiId}/${name}`);
+        if (suppressedAtStart.has(key) || captureSuppressions.has(key)) {
+            result.skipped++;
+            continue;
+        }
+        try {
+            const row = await save({
+                kind: 'preset',
+                target: `${apiId}/${name}`,
+                label: `${name} (${apiId})`,
+                data: preset,
+            });
+            result[row ? 'taken' : 'skipped']++;
+        } catch (error) {
+            result.failed++;
+            console.error(`[Time Machine] could not snapshot preset ${apiId}/${name}`, error);
         }
     }
-    return taken;
+    return result;
 }
 
 /**
@@ -177,49 +276,103 @@ export async function capturePresets() {
  */
 export async function captureEverything(onProgress = () => {}) {
     const context = ctx();
-    let taken = 0;
-
-    await context.getCharacters();
-    const characters = [...(context.characters ?? [])];
-    for (const [done, character] of characters.entries()) {
-        onProgress(`Characters: ${done + 1} of ${characters.length}`);
-        if (await captureCharacter(character.avatar)) {
-            taken++;
+    const result = { taken: 0, skipped: 0, failed: 0 };
+    const capture = async (label, action) => {
+        try {
+            const row = await action();
+            result[row ? 'taken' : 'skipped']++;
+        } catch (error) {
+            result.failed++;
+            console.error(`[Time Machine] could not snapshot ${label}`, error);
         }
+    };
+
+    try {
+        await context.getCharacters();
+        const characters = [...(context.characters ?? [])];
+        for (const [done, character] of characters.entries()) {
+            onProgress(`Characters: ${done + 1} of ${characters.length}`);
+            const avatar = character?.avatar;
+            await capture(character?.name || avatar || 'character', () => captureCharacter(avatar, { force: true }));
+        }
+    } catch (error) {
+        result.failed++;
+        console.error('[Time Machine] could not read characters', error);
     }
 
-    const names = context.getWorldInfoNames?.() ?? [];
-    for (const [done, name] of names.entries()) {
-        onProgress(`Lorebooks: ${done + 1} of ${names.length}`);
-        if (await captureLorebook(name)) {
-            taken++;
+    try {
+        const names = context.getWorldInfoNames?.() ?? [];
+        for (const [done, name] of names.entries()) {
+            onProgress(`Lorebooks: ${done + 1} of ${names.length}`);
+            await capture(name, () => captureLorebook(name, undefined, { force: true }));
         }
+    } catch (error) {
+        result.failed++;
+        console.error('[Time Machine] could not list lorebooks', error);
     }
 
     onProgress('Presets...');
-    taken += await capturePresets();
+    try {
+        const presets = await capturePresets({ force: true });
+        result.taken += presets.taken;
+        result.skipped += presets.skipped;
+        result.failed += presets.failed;
+    } catch (error) {
+        result.failed++;
+        console.error('[Time Machine] could not read presets', error);
+    }
 
-    return taken;
+    return result;
 }
 
 // ------------------------------------------------------------- live state ---
 
-/** The card as it is right now, to compare a snapshot against. */
-export async function liveCharacterCard(avatar) {
-    const live = ctx().characters ?? [];
+/** The complete recoverable character state as it is right now. */
+export async function liveCharacterState(avatar) {
+    const context = ctx();
+    const live = context.characters ?? [];
     const index = live.findIndex(character => character?.avatar === avatar);
     if (index === -1) {
         return null;
     }
-    await ctx().unshallowCharacter(index);
-    return cardFromCharacter(live[index]);
+    await context.unshallowCharacter(index);
+    const character = (context.characters ?? []).find(item => item?.avatar === avatar);
+    const data = cardFromCharacter(character);
+    if (!character || !data) {
+        return null;
+    }
+    const tags = context.tagMap?.[avatar] ?? [];
+    if (!Array.isArray(tags) || tags.some(tag => typeof tag !== 'string')) {
+        throw new Error(`SillyBunny returned malformed tags for ${avatar}`);
+    }
+    return { data, tags: structuredClone(tags) };
+}
+
+/** The card as it is right now, to compare a snapshot against. */
+export async function liveCharacterCard(avatar) {
+    return (await liveCharacterState(avatar))?.data ?? null;
 }
 
 export async function liveLorebook(name) {
+    const cached = await ctx().loadWorldInfo?.(name);
+    if (cached !== null && cached !== undefined) {
+        if (!isPlainObject(cached)) {
+            throw new Error(`SillyBunny returned a malformed lorebook for ${name}`);
+        }
+        return structuredClone(cached);
+    }
     try {
-        return await ctx().loadWorldInfo(name);
-    } catch {
-        return null;
+        const response = await post('/api/worldinfo/get', { name });
+        const book = await response.json();
+        if (!isPlainObject(book)) {
+            throw new Error(`SillyBunny returned a malformed lorebook for ${name}`);
+        }
+        return book;
+    } catch (error) {
+        if (error.status === 404) {
+            return null;
+        }
+        throw error;
     }
 }
 
@@ -239,22 +392,48 @@ export async function liveLorebook(name) {
  * @param {string[]|null} tags
  */
 export async function restoreCharacter(avatar, card, live, tags) {
-    const payload = restorePayload(live ?? {}, card, ctx().constants.unset);
-    await post('/api/characters/merge-attributes', { avatar, ...payload });
-
-    if (Array.isArray(tags) && ctx().tagMap) {
-        ctx().tagMap[avatar] = structuredClone(tags);
-        ctx().saveSettingsDebounced();
+    const context = ctx();
+    if (!isPlainObject(card) || !isPlainObject(live)) {
+        throw new TypeError('Invalid character snapshot');
     }
-    await ctx().getCharacters();
+    const payload = restorePayload(live ?? {}, card, context.constants?.unset);
+    if (tags !== undefined && (!Array.isArray(tags) || tags.some(tag => typeof tag !== 'string') || !context.tagMap)) {
+        throw new Error('This SillyBunny version cannot restore character tags safely');
+    }
+    return suppressCapture('character', avatar, async () => {
+        let started = false;
+        try {
+            started = true;
+            await post('/api/characters/merge-attributes', { ...payload, avatar });
+            if (tags !== undefined) {
+                context.tagMap[avatar] = structuredClone(tags);
+                await commitSettings();
+            }
+            await context.getCharacters();
+        } catch (error) {
+            throw started ? partialRestore(error) : error;
+        }
+    });
 }
 
 export async function restoreLorebook(name, book) {
     // `immediately`: the ordinary path debounces by several seconds, which races
     // the editor if the book being restored is the one on screen.
-    await ctx().saveWorldInfo(name, book, true);
-    ctx().updateWorldInfoList?.();
-    ctx().reloadWorldInfoEditor?.(name);
+    if (!isPlainObject(book)) {
+        throw new TypeError('Invalid lorebook snapshot');
+    }
+    return suppressCapture('lorebook', name, async () => {
+        let started = false;
+        try {
+            const context = ctx();
+            started = true;
+            await context.saveWorldInfo(name, book, true);
+            await context.updateWorldInfoList?.();
+            await context.reloadWorldInfoEditor?.(name);
+        } catch (error) {
+            throw started ? partialRestore(error) : error;
+        }
+    });
 }
 
 /**
@@ -268,23 +447,72 @@ export async function restoreLorebook(name, book) {
  * back for good.
  */
 export async function restorePreset(apiId, name, preset) {
-    const response = await post('/api/presets/save', { preset, name, apiId });
-    const body = await response.json().catch(() => ({}));
-    // The server sanitises the name, so what it stored may not be what was sent.
-    return body?.name ?? name;
+    if (!isPlainObject(preset)) {
+        throw new TypeError('Invalid preset snapshot');
+    }
+    const manager = ctx().getPresetManager?.(apiId);
+    if (typeof manager?.updateList !== 'function') {
+        throw new Error(`This SillyBunny version cannot refresh ${apiId} presets safely`);
+    }
+    return suppressCapture('preset', `${apiId}/${name}`, async () => {
+        let started = false;
+        let changed;
+        try {
+            const restoredPreset = structuredClone(preset);
+            if (NAMED_PRESET_APIS.has(apiId)) {
+                restoredPreset.name = name;
+            }
+            started = true;
+            const response = await post('/api/presets/save', { preset: restoredPreset, name, apiId });
+            const body = await response.json().catch(() => ({}));
+            // The server sanitises the name, so what it stored may not be what was sent.
+            const storedName = typeof body?.name === 'string' ? body.name : name;
+            if (NAMED_PRESET_APIS.has(apiId) && restoredPreset.name !== storedName) {
+                restoredPreset.name = storedName;
+                await post('/api/presets/save', { preset: restoredPreset, name: storedName, apiId });
+            }
+            const refresh = async () => {
+                changed = waitForPresetChange(apiId);
+                await manager.updateList(storedName, restoredPreset);
+                await changed.promise;
+            };
+            if (storedName === name) {
+                await refresh();
+            } else {
+                await suppressCapture('preset', `${apiId}/${storedName}`, refresh);
+            }
+            return storedName;
+        } catch (error) {
+            changed?.cancel();
+            throw started ? partialRestore(error) : error;
+        }
+    });
 }
 
 /**
  * Writes one extension's settings block back from a host settings backup.
  *
- * This is the path for the damage that prompted the extension: an "Update All"
- * that rebuilt every agent from its bundled template and kept six fields.
  * Extensions read their settings once at startup, so this cannot take effect
  * until the page is reloaded — the caller has to say so.
  */
-export function restoreExtensionBlock(key, value) {
-    ctx().extensionSettings[key] = structuredClone(value);
-    ctx().saveSettingsDebounced();
+export async function restoreExtensionBlock(key, value) {
+    if (!isRestorableExtensionBlock(key, value)) {
+        throw new Error('Refusing to restore a reserved or malformed settings block');
+    }
+    const settings = ctx().extensionSettings;
+    const hadPrevious = Object.prototype.hasOwnProperty.call(settings, key);
+    const previous = settings[key];
+    settings[key] = structuredClone(value);
+    try {
+        await commitSettings();
+    } catch (error) {
+        if (hadPrevious) {
+            settings[key] = previous;
+        } else {
+            delete settings[key];
+        }
+        throw error;
+    }
 }
 
 // -------------------------------------------------- the host's own backups ---
@@ -293,7 +521,10 @@ export function restoreExtensionBlock(key, value) {
 export async function listHostSnapshots() {
     const response = await post('/api/settings/get-snapshots', {});
     const rows = await response.json();
-    return Array.isArray(rows) ? rows.sort((a, b) => b.date - a.date) : [];
+    return Array.isArray(rows)
+        ? rows.filter(row => typeof row?.name === 'string' && Number.isFinite(row.date) && Number.isFinite(row.size))
+            .sort((a, b) => b.date - a.date)
+        : [];
 }
 
 /**
@@ -305,12 +536,21 @@ export async function listHostSnapshots() {
  */
 export async function loadHostSnapshot(name) {
     const response = await post('/api/settings/load-snapshot', { name });
-    return response.json();
+    const settings = await response.json();
+    if (!isPlainObject(settings)) {
+        throw new Error('SillyBunny returned a malformed settings backup');
+    }
+    return settings;
 }
 
 /** The extension settings blocks a backup carries, as names a user recognises. */
 export function hostSnapshotParts(settings) {
-    return Object.keys(settings?.extension_settings ?? {})
+    const blocks = settings?.extension_settings;
+    if (!isPlainObject(blocks)) {
+        return [];
+    }
+    return Object.keys(blocks)
+        .filter(key => isRestorableExtensionBlock(key, blocks[key]))
         .sort()
         .map(key => ({ kind: 'extension', key, label: key }));
 }

@@ -1,35 +1,151 @@
 /**
  * Card & Lorebook Time Machine.
  *
- * Automatic snapshots of the things SillyBunny does not back up — characters,
- * lorebooks and presets — with a comparison view and one-click restore.
+ * Automatic snapshots of the things SillyBunny does not back up: characters,
+ * lorebooks and presets, with comparison and deliberate restore controls.
  */
 import { captureCharacter, captureLorebook, capturePresets } from './src/api.js';
+import { reconcile, renameTarget } from './src/store.js';
 import { closeTimeMachine, openTimeMachine, renderDrawer } from './src/ui.js';
 
 const MENU_ITEM_ID = 'sbctm-menu-item';
 const DRAWER_ID = 'sbctm-settings-drawer';
 
 const subscriptions = [];
+const pendingOperations = new Set();
 let active = false;
+let prepared = false;
+let preparing = false;
+let lastWarningAt = 0;
+let lifecycle = 0;
 
 function ctx() {
     return globalThis.SillyTavern.getContext();
 }
 
-function subscribe(eventType, handler) {
+function subscribe(context, eventType, handler) {
     if (!eventType) {
         return;
     }
-    ctx().eventSource.on(eventType, handler);
-    subscriptions.push({ eventType, handler });
+    context.eventSource.on(eventType, handler);
+    subscriptions.push({ eventSource: context.eventSource, eventType, handler });
 }
 
 /** A capture must never take the app down with it. */
-function guard(promise) {
-    void Promise.resolve(promise).catch((error) => {
-        console.error('[Time Machine] snapshot failed', error);
+function guard(promise, label = 'automatic snapshot') {
+    const operation = Promise.resolve(promise).then((result) => {
+        if (result?.failed > 0) {
+            warn(`${result.failed} ${label}${result.failed === 1 ? '' : 's'} failed`);
+        }
+        return result;
+    }).catch((error) => {
+        warn(`${label} failed`, error);
     });
+    pendingOperations.add(operation);
+    void operation.finally(() => pendingOperations.delete(operation));
+    return operation;
+}
+
+function warn(message, error) {
+    console.error(`[Time Machine] ${message}`, error ?? '');
+    const now = Date.now();
+    if (now - lastWarningAt >= 60_000) {
+        lastWarningAt = now;
+        globalThis.toastr?.warning('Time Machine could not protect every change. Check the console before relying on its history.');
+    }
+}
+
+function assertCapabilities(context) {
+    const missing = [];
+    for (const [name, available] of [
+        ['extension settings', context.extensionSettings && typeof context.saveSettingsDebounced === 'function'],
+        ['event source', typeof context.eventSource?.on === 'function' && typeof context.eventSource?.removeListener === 'function'],
+        ['request headers', typeof context.getRequestHeaders === 'function'],
+        ['character loading', typeof context.getCharacters === 'function' && typeof context.unshallowCharacter === 'function'],
+        ['character tags', context.tagMap && typeof context.tagMap === 'object'],
+        ['exact character restore', context.constants?.unset !== undefined],
+        ['lorebook access', typeof context.getWorldInfoNames === 'function'
+            && typeof context.loadWorldInfo === 'function'
+            && typeof context.saveWorldInfo === 'function'],
+        ['preset access', typeof context.getPresetManager === 'function'],
+        ['popup API', typeof context.Popup === 'function'
+            && context.POPUP_TYPE?.TEXT !== undefined
+            && context.POPUP_TYPE?.CONFIRM !== undefined],
+    ]) {
+        if (!available) {
+            missing.push(name);
+        }
+    }
+    for (const event of [
+        'APP_READY',
+        'CHARACTER_EDITOR_OPENED',
+        'CHARACTER_EDITED',
+        'CHARACTER_RENAMED',
+        'WORLDINFO_UPDATED',
+        'PRESET_CHANGED',
+        'PRESET_RENAMED',
+    ]) {
+        if (!context.eventTypes?.[event]) {
+            missing.push(`event ${event}`);
+        }
+    }
+    if (missing.length > 0) {
+        throw new Error(`Unsupported SillyBunny context; missing ${missing.join(', ')}`);
+    }
+}
+
+function prepareHistory() {
+    if (prepared || preparing) {
+        return;
+    }
+    preparing = true;
+    const generation = lifecycle;
+    const operation = reconcile()
+        .then(() => capturePresets())
+        .then((result) => {
+            if (active && generation === lifecycle) {
+                prepared = result.failed === 0;
+            }
+            return result;
+        })
+        .finally(() => {
+            if (generation === lifecycle) {
+                preparing = false;
+            }
+        });
+    guard(operation, 'startup history check');
+}
+
+function unsubscribeAll() {
+    while (subscriptions.length) {
+        const { eventSource, eventType, handler } = subscriptions.pop();
+        eventSource.removeListener(eventType, handler);
+    }
+}
+
+function removeUi() {
+    document.getElementById(MENU_ITEM_ID)?.remove();
+    document.getElementById(DRAWER_ID)?.remove();
+}
+
+function setupUi() {
+    ensureMenuItem();
+    ensureDrawer();
+    prepareHistory();
+}
+
+function reportActivationFailure(error) {
+    console.error('[Time Machine] could not activate', error);
+    globalThis.toastr?.error('Time Machine is not compatible with this SillyBunny version and was not enabled.');
+    throw error;
+}
+
+function start() {
+    try {
+        init();
+    } catch (error) {
+        reportActivationFailure(error);
+    }
 }
 
 function onOpen(event) {
@@ -84,8 +200,11 @@ function ensureDrawer() {
         drawer.id = DRAWER_ID;
         drawer.className = 'inline-drawer';
 
-        const toggle = document.createElement('div');
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
         toggle.className = 'inline-drawer-toggle inline-drawer-header';
+        toggle.setAttribute('aria-expanded', 'false');
+        toggle.setAttribute('aria-controls', `${DRAWER_ID}-content`);
         const title = document.createElement('b');
         title.textContent = 'Time Machine';
         const chevron = document.createElement('div');
@@ -93,7 +212,11 @@ function ensureDrawer() {
         toggle.append(title, chevron);
 
         const content = document.createElement('div');
+        content.id = `${DRAWER_ID}-content`;
         content.className = 'inline-drawer-content';
+        toggle.addEventListener('click', () => {
+            toggle.setAttribute('aria-expanded', String(toggle.getAttribute('aria-expanded') !== 'true'));
+        });
         drawer.append(toggle, content);
         host.append(drawer);
     }
@@ -104,47 +227,68 @@ function init() {
     if (active) {
         return;
     }
-    active = true;
-    const events = ctx().eventTypes;
+    const context = ctx();
+    assertCapabilities(context);
+    const events = context.eventTypes;
 
-    subscribe(events.APP_READY, () => {
+    try {
+        subscribe(context, events.APP_READY, () => {
+            try {
+                setupUi();
+            } catch (error) {
+                warn('startup UI refresh failed', error);
+            }
+        });
+
+        // Opening the editor is the baseline: it is the last moment the card is
+        // certainly as the user left it. Identical snapshots are discarded, so
+        // capturing here costs nothing when nothing is changed.
+        subscribe(context, events.CHARACTER_EDITOR_OPENED, (chid) => {
+            const avatar = ctx().characters?.[chid]?.avatar;
+            if (avatar) {
+                guard(captureCharacter(avatar));
+            }
+        });
+
+        subscribe(context, events.CHARACTER_EDITED, (event) => {
+            const avatar = event?.detail?.character?.avatar ?? ctx().characters?.[event?.detail?.id]?.avatar;
+            if (avatar) {
+                guard(captureCharacter(avatar));
+            }
+        });
+
+        // WORLDINFO_UPDATED fires from inside the host's own save, after the write
+        // succeeded, and carries the book, so this is the complete set of
+        // lorebook saves with no polling and no second read.
+        subscribe(context, events.WORLDINFO_UPDATED, (name, data) => {
+            if (name) {
+                guard(captureLorebook(name, data));
+            }
+        });
+
+        // Presets have no save event at all. Switching preset is the nearest
+        // thing: the previous one has been written by then.
+        subscribe(context, events.PRESET_CHANGED, () => guard(capturePresets()));
+        subscribe(context, events.CHARACTER_RENAMED, (oldAvatar, newAvatar) => {
+            guard(renameTarget('character', oldAvatar, newAvatar), 'character history rename');
+        });
+        subscribe(context, events.PRESET_RENAMED, ({ apiId, oldName, newName } = {}) => {
+            if (apiId && oldName && newName) {
+                guard(renameTarget('preset', `${apiId}/${oldName}`, `${apiId}/${newName}`, `${newName} (${apiId})`), 'preset history rename');
+            }
+        });
+
         ensureMenuItem();
         ensureDrawer();
-        guard(capturePresets());
-    });
-
-    // Opening the editor is the baseline: it is the last moment the card is
-    // certainly as the user left it. Identical snapshots are discarded, so
-    // capturing here costs nothing when nothing is changed.
-    subscribe(events.CHARACTER_EDITOR_OPENED, (chid) => {
-        const avatar = ctx().characters?.[chid]?.avatar;
-        if (avatar) {
-            guard(captureCharacter(avatar));
-        }
-    });
-
-    subscribe(events.CHARACTER_EDITED, (event) => {
-        const avatar = event?.detail?.character?.avatar ?? ctx().characters?.[event?.detail?.id]?.avatar;
-        if (avatar) {
-            guard(captureCharacter(avatar));
-        }
-    });
-
-    // WORLDINFO_UPDATED fires from inside the host's own save, after the write
-    // succeeded, and carries the book — so this is the complete set of lorebook
-    // saves with no polling and no second read.
-    subscribe(events.WORLDINFO_UPDATED, (name, data) => {
-        if (name) {
-            guard(captureLorebook(name, data));
-        }
-    });
-
-    // Presets have no save event at all. Switching preset is the nearest thing:
-    // whatever was done to the previous one has been written by then.
-    subscribe(events.PRESET_CHANGED, () => guard(capturePresets()));
-
-    ensureMenuItem();
-    ensureDrawer();
+        active = true;
+        lifecycle++;
+        prepareHistory();
+    } catch (error) {
+        active = false;
+        unsubscribeAll();
+        removeUi();
+        throw error;
+    }
 }
 
 async function deactivate() {
@@ -152,22 +296,29 @@ async function deactivate() {
         return;
     }
     active = false;
-    const { eventSource } = ctx();
-    while (subscriptions.length) {
-        const { eventType, handler } = subscriptions.pop();
-        eventSource.removeListener(eventType, handler);
+    lifecycle++;
+    unsubscribeAll();
+    removeUi();
+    prepared = false;
+    preparing = false;
+    let timer;
+    const finished = Promise.allSettled([closeTimeMachine(), ...pendingOperations]).then(() => true);
+    const settled = await Promise.race([
+        finished,
+        new Promise(resolve => { timer = setTimeout(() => resolve(false), 2_000); }),
+    ]);
+    clearTimeout(timer);
+    if (!settled) {
+        warn('disable timed out while an operation was still finishing');
     }
-    document.getElementById(MENU_ITEM_ID)?.remove();
-    document.getElementById(DRAWER_ID)?.remove();
-    await closeTimeMachine();
 }
 
 export function activate() {
-    init();
+    start();
 }
 
 export function enable() {
-    init();
+    start();
 }
 
 export function disable() {

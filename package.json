@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "lint": "node --check index.js && node --check src/core.js && node --check src/store.js && node --check src/api.js && node --check src/ui.js && node --check test/core.test.js"
+    "lint": "node --check index.js && node --check src/core.js && node --check src/store.js && node --check src/api.js && node --check src/ui.js && node --check test/core.test.js && node --check test/store.test.js && node --check test/api.test.js && node --check test/index.test.js"
   },
   "engines": {
     "node": ">=20"

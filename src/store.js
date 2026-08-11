@@ -1,36 +1,20 @@
-/**
- * Where snapshots live.
- *
- * Blobs go to the host's file store (POST /api/files/upload), which is the only
- * place a browser extension can put megabytes on the server. The index — a few
- * dozen bytes per snapshot — goes in extension settings, because every write
- * there re-serialises the whole of settings.json and copies it into the backup
- * folder on a timer. Snapshots in settings.json would make that copy grow with
- * the history it is supposed to be independent of.
- */
-import { DEFAULT_KEEP_PER_TARGET, DEFAULT_MAX_TOTAL_BYTES, hashOf, prunePlan, snapshotFileName } from './core.js';
+/** Snapshot blobs, their validated settings index, and retention. */
+import {
+    DEFAULT_KEEP_PER_TARGET,
+    DEFAULT_MAX_TOTAL_BYTES,
+    canonicalJson,
+    hashOf,
+    isPlainObject,
+    legacyHashOf,
+    prunePlan,
+    snapshotFileName,
+} from './core.js';
 
 export const MODULE_NAME = 'SillyBunnyCardTimeMachine';
 const SETTINGS_VERSION = 1;
-
-/**
- * Data Maid offers to delete anything in the files directory that nothing
- * refers to, and it reads `character_attachments` as a map of arrays without
- * caring what the keys mean. The Data Bank UI, meanwhile, only ever renders the
- * array under the CURRENT character's avatar filename. A key that is not any
- * character's avatar therefore keeps Data Maid satisfied while staying out of
- * the user's attachment list, which is where these belong: they are this
- * extension's bookkeeping, not files the user attached to anything.
- *
- * ponytail: if the host ever validates that key against real characters, move
- * the registrations to the global `attachments` array and accept that snapshots
- * become visible in the Data Bank.
- *
- * The key keeps the extension's original name, as does MODULE_NAME below. Both
- * are storage keys: renaming one orphans every registration written under the
- * old one, which is how you get snapshots Data Maid offers to delete.
- */
 const ATTACHMENT_KEY = '__SillyBunny-Card-Time-Machine__';
+const KINDS = new Set(['character', 'lorebook', 'preset']);
+const COMMIT_TIMEOUT = 12_000;
 
 function ctx() {
     return globalThis.SillyTavern.getContext();
@@ -40,33 +24,106 @@ function defaults() {
     return {
         settingsVersion: SETTINGS_VERSION,
         snapshots: [],
+        quarantinedSnapshots: [],
         captureCharacters: true,
         captureLorebooks: true,
         capturePresets: true,
         keepPerTarget: DEFAULT_KEEP_PER_TARGET,
         maxTotalBytes: DEFAULT_MAX_TOTAL_BYTES,
+        lastCommit: '',
     };
 }
 
+function uniqueToken() {
+    return globalThis.crypto?.randomUUID?.()
+        ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function canonicalUrl(name) {
+    return `/files/${name}`;
+}
+
+function normalUrl(url) {
+    return typeof url === 'string' ? `/${url}`.replace(/^\/+/, '/') : '';
+}
+
+function normalizeRow(value) {
+    if (!isPlainObject(value)
+        || !KINDS.has(value.kind)
+        || typeof value.target !== 'string' || value.target === ''
+        || typeof value.label !== 'string'
+        || typeof value.name !== 'string'
+        || !Number.isFinite(value.ts)
+        || !Number.isFinite(value.size) || value.size < 0
+        || (value.hash !== null && !/^[0-9a-f]{64}$/.test(value.hash ?? ''))
+        || (value.sourceTarget !== undefined && (typeof value.sourceTarget !== 'string' || value.sourceTarget === ''))
+        || !new RegExp(`^cardtm_${value.kind}_[A-Za-z0-9_-]+\\.json$`).test(value.name)
+        || normalUrl(value.url) !== canonicalUrl(value.name)) {
+        return null;
+    }
+    return {
+        ...value,
+        id: value.name,
+        ts: Number(value.ts),
+        size: Number(value.size),
+        url: canonicalUrl(value.name),
+    };
+}
+
+let needsRepair = false;
+const protectedSnapshotIds = new Set();
+
 export function getSettings() {
     const container = ctx().extensionSettings;
-    if (!container[MODULE_NAME] || typeof container[MODULE_NAME] !== 'object') {
+    if (!isPlainObject(container[MODULE_NAME])) {
         container[MODULE_NAME] = defaults();
+        needsRepair = true;
     }
     const settings = container[MODULE_NAME];
+    const before = canonicalJson(settings);
+
     if (!Array.isArray(settings.snapshots)) {
         settings.snapshots = [];
     }
-    for (const [key, value] of Object.entries(defaults())) {
-        if (typeof settings[key] !== typeof value || settings[key] === null) {
-            settings[key] = value;
+    if (!Array.isArray(settings.quarantinedSnapshots)) {
+        settings.quarantinedSnapshots = [];
+    }
+
+    const valid = [];
+    const seen = new Set();
+    for (const candidate of settings.snapshots) {
+        const row = normalizeRow(candidate);
+        if (!row || seen.has(row.id)) {
+            settings.quarantinedSnapshots.push(candidate);
+            continue;
+        }
+        seen.add(row.id);
+        valid.push(row);
+    }
+    settings.snapshots = valid;
+
+    for (const key of ['captureCharacters', 'captureLorebooks', 'capturePresets']) {
+        if (typeof settings[key] !== 'boolean') {
+            settings[key] = defaults()[key];
         }
     }
+    settings.keepPerTarget = Number.isFinite(settings.keepPerTarget)
+        ? Math.max(1, Math.floor(settings.keepPerTarget))
+        : DEFAULT_KEEP_PER_TARGET;
+    settings.maxTotalBytes = Number.isFinite(settings.maxTotalBytes) && settings.maxTotalBytes > 0
+        ? Math.floor(settings.maxTotalBytes)
+        : DEFAULT_MAX_TOTAL_BYTES;
+    settings.lastCommit = typeof settings.lastCommit === 'string' ? settings.lastCommit : '';
     settings.settingsVersion = SETTINGS_VERSION;
+
+    needsRepair ||= before !== canonicalJson(settings);
     return settings;
 }
 
 export function saveSettings() {
+    if (typeof ctx().saveSettingsDebounced !== 'function') {
+        throw new Error('This SillyBunny version cannot save extension settings');
+    }
     ctx().saveSettingsDebounced();
 }
 
@@ -74,13 +131,24 @@ export function listSnapshots() {
     return getSettings().snapshots;
 }
 
+/** Keeps restore inputs out of retention while a restore is in flight. */
+export function pinSnapshots(ids) {
+    ids.filter(Boolean).forEach(id => protectedSnapshotIds.add(id));
+}
+
+export function unpinSnapshots(ids) {
+    ids.filter(Boolean).forEach(id => protectedSnapshotIds.delete(id));
+}
+
 /** The hash of the newest snapshot of a target, or null if there is none. */
 export function lastHashOf(kind, target) {
-    const matches = listSnapshots().filter(s => s.kind === kind && s.target === target);
-    if (matches.length === 0) {
-        return null;
-    }
-    return matches.reduce((newest, s) => (s.ts > newest.ts ? s : newest)).hash;
+    return newestRow(kind, target)?.hash ?? null;
+}
+
+function newestRow(kind, target) {
+    return listSnapshots()
+        .filter(row => row.kind === kind && row.target === target)
+        .sort((a, b) => b.ts - a.ts)[0] ?? null;
 }
 
 async function post(url, body) {
@@ -90,140 +158,395 @@ async function post(url, body) {
         body: JSON.stringify(body),
     });
     if (!response.ok) {
-        throw new Error(`${url} responded ${response.status}`);
+        const error = new Error(`${url} responded ${response.status}`);
+        error.status = response.status;
+        throw error;
     }
     return response;
 }
 
-/**
- * Saves run one at a time.
- *
- * "Is this the same as last time" is answered from the index, and the index is
- * only written at the end of a save. Two captures of the same thing in flight at
- * once therefore both read an empty history and both store a copy — which is
- * exactly what happens when startup and a preset switch land together. Snapshots
- * are not on any hot path, so a single queue is cheaper than reasoning about
- * which pairs can overlap.
- */
-let queue = Promise.resolve();
+async function readPersistedSettings() {
+    const response = await post('/api/settings/get', {});
+    const body = await response.json();
+    const source = typeof body?.settings === 'string' ? JSON.parse(body.settings) : body?.settings ?? body;
+    if (!isPlainObject(source)) {
+        throw new Error('SillyBunny returned malformed settings');
+    }
+    return source;
+}
 
-export function save(request) {
-    const run = queue.then(() => saveNow(request), () => saveNow(request));
-    // The queue itself must not inherit a rejection, or one failed capture stops
-    // every later one.
-    queue = run.then(() => {}, () => {});
+function persistedModule(settings) {
+    const block = settings?.extension_settings?.[MODULE_NAME];
+    return isPlainObject(block) ? block : null;
+}
+
+async function assertCurrentIndex() {
+    const remoteCommit = persistedModule(await readPersistedSettings())?.lastCommit ?? '';
+    if (remoteCommit !== getSettings().lastCommit) {
+        throw new Error('Time Machine changed in another tab. Reload SillyBunny before changing its history.');
+    }
+}
+
+function waitForSettingsUpdate(timeout = 500) {
+    const context = ctx();
+    const type = context.eventTypes?.SETTINGS_UPDATED;
+    return new Promise(resolve => {
+        let timer;
+        const done = () => {
+            clearTimeout(timer);
+            if (type) {
+                context.eventSource?.removeListener?.(type, done);
+            }
+            resolve();
+        };
+        if (type) {
+            context.eventSource?.on?.(type, done);
+        }
+        timer = setTimeout(done, timeout);
+    });
+}
+
+/** Saves settings and resolves only after the module's commit token is read back. */
+export function commitSettings() {
+    return enqueueMutation(commitNow);
+}
+
+async function commitNow() {
+    await assertCurrentIndex();
+    const settings = getSettings();
+    const previous = settings.lastCommit;
+    const expected = uniqueToken();
+    settings.lastCommit = expected;
+    const deadline = Date.now() + COMMIT_TIMEOUT;
+    let lastError;
+
+    let changed = waitForSettingsUpdate();
+    try {
+        saveSettings();
+    } catch (error) {
+        if (settings.lastCommit === expected) {
+            settings.lastCommit = previous;
+        }
+        throw error;
+    }
+    while (Date.now() < deadline) {
+        await changed;
+        try {
+            if (persistedModule(await readPersistedSettings())?.lastCommit === expected) {
+                needsRepair = false;
+                return;
+            }
+        } catch (error) {
+            lastError = error;
+        }
+        changed = waitForSettingsUpdate(Math.min(500, Math.max(0, deadline - Date.now())));
+    }
+
+    if (settings.lastCommit === expected) {
+        settings.lastCommit = previous;
+    }
+    const error = new Error('Could not confirm that Time Machine settings were saved', { cause: lastError });
+    error.code = 'COMMIT_UNCONFIRMED';
+    throw error;
+}
+
+function snapshotContent(payload) {
+    const { format, kind, target, label, ts, hash, ...content } = payload;
+    return content;
+}
+
+function validatePayloadShape(row, payload) {
+    if (!isPlainObject(payload)
+        || payload.format !== 1
+        || payload.kind !== row.kind
+        || payload.target !== (row.sourceTarget ?? row.target)
+        || payload.ts !== row.ts
+        || typeof payload.label !== 'string'
+        || !isPlainObject(payload.data)
+        || (payload.tags !== undefined && (!Array.isArray(payload.tags) || payload.tags.some(tag => typeof tag !== 'string')))) {
+        throw new Error(`Snapshot ${row.name} does not match its index`);
+    }
+}
+
+async function validatePayloadHash(row, payload) {
+    const expected = await (Object.prototype.hasOwnProperty.call(payload, 'hash')
+        ? hashOf(snapshotContent(payload))
+        : legacyHashOf(payload.data));
+    if (!expected) {
+        return;
+    }
+    if (row.hash && row.hash !== expected) {
+        throw new Error(`Snapshot ${row.name} failed its integrity check`);
+    }
+    if (payload.hash && payload.hash !== expected) {
+        throw new Error(`Snapshot ${row.name} failed its integrity check`);
+    }
+}
+
+function requireRow(row) {
+    const valid = normalizeRow(row);
+    if (!valid) {
+        throw new Error('Refusing an invalid Time Machine file path');
+    }
+    return valid;
+}
+
+async function upload(name, text) {
+    const response = await post('/api/files/upload', { name, data: base64(text) });
+    const body = await response.json();
+    if (normalUrl(body?.path) !== canonicalUrl(name)) {
+        throw new Error('SillyBunny returned an unexpected snapshot path');
+    }
+}
+
+let mutationQueue = Promise.resolve();
+
+function enqueueMutation(action) {
+    const run = mutationQueue.then(() => withBrowserLock(action), () => withBrowserLock(action));
+    mutationQueue = run.then(() => {}, () => {});
     return run;
 }
 
-/**
- * Stores one snapshot, unless it is byte-identical to the previous one for the
- * same target.
- *
- * @returns {Promise<object|null>} the index row, or null when nothing changed.
- */
-async function saveNow({ kind, target, label, data, extra = {} }) {
-    const payload = { format: 1, kind, target, label, ts: Date.now(), data, ...extra };
-    const hash = await hashOf(payload.data);
-    if (hash === lastHashOf(kind, target)) {
-        return null;
+function withBrowserLock(action) {
+    // ponytail: Web Locks coordinate tabs in one browser. The persisted commit
+    // check fails closed for other devices instead of building a custom leader.
+    return globalThis.navigator?.locks?.request
+        ? globalThis.navigator.locks.request('sillybunny-time-machine', async () => action())
+        : action();
+}
+
+export function save(request, options = {}) {
+    return enqueueMutation(() => saveNow(request, options));
+}
+
+async function saveNow({ kind, target, label, data, extra = {} }, { skipPrune = false, protectedIds = [] } = {}) {
+    if (!KINDS.has(kind) || typeof target !== 'string' || !target || typeof label !== 'string'
+        || !isPlainObject(data) || !isPlainObject(extra)) {
+        throw new TypeError('Invalid snapshot request');
+    }
+    const reserved = ['format', 'kind', 'target', 'label', 'ts', 'hash', 'data'];
+    if (reserved.some(key => Object.prototype.hasOwnProperty.call(extra, key))) {
+        throw new TypeError('Snapshot extras contain a reserved field');
     }
 
+    await assertCurrentIndex();
+    const content = { data: structuredClone(data), ...structuredClone(extra) };
+    const hash = await hashOf(content);
+    const previous = newestRow(kind, target);
+    if (hash && previous?.hash === hash) {
+        try {
+            await load(previous, { forgetMissing: false });
+            if (!skipPrune) {
+                await pruneNow({ protectedIds });
+            }
+            return null;
+        } catch (error) {
+            console.warn('[Time Machine] replacing an unreadable duplicate', previous.name, error);
+            if (error.code === 'SNAPSHOT_MISSING') {
+                settingsWithout(previous);
+            }
+        }
+    }
+
+    if (!hash) {
+        console.warn('[Time Machine] WebCrypto is unavailable; saving without deduplication or integrity hashing');
+    }
     const settings = getSettings();
+    const ts = settings.snapshots.reduce((latest, row) => Math.max(latest, row.ts + 1), Date.now());
+    const name = snapshotFileName(kind, target, `${ts}_${uniqueToken()}`, settings.snapshots.map(row => row.name));
+    const payload = { format: 1, kind, target, label, ts, ...content, hash };
     const text = JSON.stringify(payload);
-    const name = snapshotFileName(kind, target, payload.ts, settings.snapshots.map(s => s.name));
-
-    const response = await post('/api/files/upload', {
-        name,
-        // btoa needs latin1, and card text is not. Encode first, then map bytes.
-        data: base64(text),
-    });
-    const { path } = await response.json();
-
     const row = {
-        id: `${kind}:${target}:${payload.ts}`,
-        ts: payload.ts,
+        id: name,
+        ts,
         kind,
         target,
         label,
         name,
-        url: path,
+        url: canonicalUrl(name),
         hash,
         size: new TextEncoder().encode(text).length,
     };
+
+    await upload(name, text);
     settings.snapshots.push(row);
     registerAttachment(row);
-    saveSettings();
+    try {
+        await commitNow();
+    } catch (error) {
+        if (error.code === 'COMMIT_UNCONFIRMED') {
+            throw error;
+        }
+        settings.snapshots = settings.snapshots.filter(item => item.id !== row.id);
+        unregisterAttachment(row);
+        await deleteBlob(row).catch(cleanupError => {
+            console.error('[Time Machine] could not clean up an unindexed snapshot', row.name, cleanupError);
+        });
+        throw error;
+    }
 
-    await prune();
+    if (!skipPrune) {
+        await pruneNow({ protectedIds }).catch(error => {
+            console.error('[Time Machine] snapshot saved, but retention failed', error);
+        });
+    }
     return row;
 }
 
-/**
- * The stored payload behind an index row.
- *
- * A row whose file is gone is dropped rather than left in the timeline. The two
- * can drift apart in ordinary use: settings.json is written on a debounce, so a
- * browser closed at the wrong moment leaves rows for files that were deleted,
- * and a restored settings.json brings back rows for files that no longer exist.
- * Offering a version that can never be restored is worse than not listing it.
- */
-export async function load(row) {
-    const response = await fetch(`/${row.url}`.replace(/^\/+/, '/'), { cache: 'no-store' });
+/** Loads and verifies the blob behind an already-validated index row. */
+export async function load(row, { forgetMissing = true } = {}) {
+    const valid = requireRow(row);
+    const response = await fetch(valid.url, { cache: 'no-store' });
     if (response.status === 404) {
-        forget(row);
-        throw new Error(`Snapshot ${row.name} is no longer on the server`);
+        if (forgetMissing) {
+            void forget(valid).catch(error => console.error('[Time Machine] could not remove a missing snapshot row', error));
+        }
+        const error = new Error(`Snapshot ${valid.name} is no longer on the server`);
+        error.code = 'SNAPSHOT_MISSING';
+        throw error;
     }
     if (!response.ok) {
-        throw new Error(`Could not read snapshot ${row.name} (${response.status})`);
+        throw new Error(`Could not read snapshot ${valid.name} (${response.status})`);
     }
-    return response.json();
-}
-
-/** Drops an index row without trying to delete a file behind it. */
-function forget(row) {
-    const settings = getSettings();
-    settings.snapshots = settings.snapshots.filter(s => s.id !== row.id);
-    unregisterAttachment(row);
-    saveSettings();
-}
-
-export async function remove(row) {
+    let payload;
     try {
-        await post('/api/files/delete', { path: row.url });
+        payload = await response.json();
     } catch (error) {
-        // A blob that is already gone must not strand its index row, or the
-        // timeline offers a restore that can never work.
-        console.warn('[Time Machine] could not delete snapshot file', row.name, error);
+        throw new Error(`Snapshot ${valid.name} is not valid JSON`, { cause: error });
     }
-    forget(row);
+    validatePayloadShape(valid, payload);
+    await validatePayloadHash(valid, payload);
+    return payload;
 }
 
-/** Applies the retention settings. Called after every successful capture. */
-export async function prune() {
+function settingsWithout(row) {
+    const settings = getSettings();
+    settings.snapshots = settings.snapshots.filter(item => item.id !== row.id);
+    unregisterAttachment(row);
+}
+
+function forget(row) {
+    return enqueueMutation(async () => {
+        const valid = requireRow(row);
+        await assertCurrentIndex();
+        const settings = getSettings();
+        if (!settings.snapshots.some(item => item.id === valid.id)) {
+            return;
+        }
+        settingsWithout(valid);
+        await commitNow();
+    });
+}
+
+async function deleteBlob(row) {
+    try {
+        await post('/api/files/delete', { path: requireRow(row).url });
+    } catch (error) {
+        if (error.status !== 404) {
+            throw error;
+        }
+    }
+}
+
+export function remove(row) {
+    return enqueueMutation(() => {
+        const valid = requireRow(row);
+        if (protectedSnapshotIds.has(valid.id)) {
+            throw new Error('That snapshot is in use by a restore and cannot be deleted');
+        }
+        return removeRows([valid]);
+    });
+}
+
+export function prune(options = {}) {
+    return enqueueMutation(() => pruneNow(options));
+}
+
+async function pruneNow({ protectedIds = [] } = {}) {
     const settings = getSettings();
     const doomed = new Set(prunePlan(settings.snapshots, {
         keepPerTarget: settings.keepPerTarget,
         maxTotalBytes: settings.maxTotalBytes,
+        protectedIds: [...protectedSnapshotIds, ...protectedIds],
     }));
-    for (const row of settings.snapshots.filter(s => doomed.has(s.id))) {
-        await remove(row);
+    return removeRows(settings.snapshots.filter(snapshot => doomed.has(snapshot.id)));
+}
+
+async function removeRows(rows) {
+    if (rows.length === 0) {
+        return 0;
     }
-    return doomed.size;
+    const settings = getSettings();
+    const ids = new Set(rows.map(row => row.id));
+    const indexed = settings.snapshots.filter(row => ids.has(row.id));
+    if (indexed.length === 0) {
+        return 0;
+    }
+
+    // Commit the index change before unlinking files. A stale tab can then fail
+    // safely without deleting blobs that the persisted index still references.
+    const previousRows = settings.snapshots;
+    const attachmentList = attachments();
+    const previousAttachments = [...attachmentList];
+    settings.snapshots = settings.snapshots.filter(row => !ids.has(row.id));
+    indexed.forEach(unregisterAttachment);
+    try {
+        await commitNow();
+    } catch (error) {
+        settings.snapshots = previousRows;
+        attachmentList.splice(0, attachmentList.length, ...previousAttachments);
+        throw error;
+    }
+
+    const failures = [];
+    for (const row of indexed) {
+        try {
+            await deleteBlob(row);
+        } catch (error) {
+            failures.push({ row, error });
+        }
+    }
+    if (failures.length === 0) {
+        return indexed.length;
+    }
+
+    // A failed or ambiguous unlink stays indexed so it can be retried and does
+    // not become an unreachable server file.
+    const current = getSettings();
+    for (const { row } of failures) {
+        if (!current.snapshots.some(item => item.id === row.id)) {
+            current.snapshots.push(row);
+            registerAttachment(row);
+        }
+    }
+    await commitNow();
+    if (failures.length === 1) {
+        throw failures[0].error;
+    }
+    throw new AggregateError(failures.map(item => item.error), 'Some snapshots could not be deleted');
 }
 
 function attachments() {
     const container = ctx().extensionSettings;
-    if (!container.character_attachments || typeof container.character_attachments !== 'object') {
+    if (!isPlainObject(container.character_attachments)) {
         container.character_attachments = {};
+        needsRepair = true;
     }
     if (!Array.isArray(container.character_attachments[ATTACHMENT_KEY])) {
         container.character_attachments[ATTACHMENT_KEY] = [];
+        needsRepair = true;
     }
     return container.character_attachments[ATTACHMENT_KEY];
 }
 
+function registration(row) {
+    return { url: row.url, size: row.size, name: row.name, created: row.ts };
+}
+
 function registerAttachment(row) {
-    attachments().push({ url: row.url, size: row.size, name: row.name, created: row.ts });
+    if (!attachments().some(entry => entry?.url === row.url)) {
+        attachments().push(registration(row));
+    }
 }
 
 function unregisterAttachment(row) {
@@ -234,11 +557,68 @@ function unregisterAttachment(row) {
     }
 }
 
+/** Repairs persisted rows/registrations and applies changed retention settings. */
+export function reconcile() {
+    return enqueueMutation(async () => {
+        await assertCurrentIndex();
+        const desired = getSettings().snapshots.map(registration);
+        const list = attachments();
+        const registrationsChanged = canonicalJson(list) !== canonicalJson(desired);
+        if (registrationsChanged) {
+            list.splice(0, list.length, ...desired);
+        }
+        if (needsRepair || registrationsChanged) {
+            await commitNow();
+        }
+        return pruneNow();
+    });
+}
+
+/** Follows host rename events without rewriting immutable snapshot blobs. */
+export function renameTarget(kind, oldTarget, newTarget, label) {
+    return enqueueMutation(async () => {
+        if (!KINDS.has(kind) || !oldTarget || !newTarget || oldTarget === newTarget) {
+            return 0;
+        }
+        await assertCurrentIndex();
+        const rows = getSettings().snapshots.filter(row => row.kind === kind && row.target === oldTarget);
+        if (rows.length === 0) {
+            return 0;
+        }
+        const previous = rows.map(row => ({ row, target: row.target, label: row.label, sourceTarget: row.sourceTarget }));
+        for (const row of rows) {
+            row.sourceTarget ??= row.target;
+            row.target = newTarget;
+            if (label !== undefined) {
+                row.label = label;
+            }
+        }
+        try {
+            await commitNow();
+        } catch (error) {
+            const current = new Map(getSettings().snapshots.map(row => [row.id, row]));
+            for (const item of previous) {
+                const row = current.get(item.row.id);
+                if (!row) {
+                    continue;
+                }
+                row.target = item.target;
+                row.label = item.label;
+                if (item.sourceTarget === undefined) {
+                    delete row.sourceTarget;
+                } else {
+                    row.sourceTarget = item.sourceTarget;
+                }
+            }
+            throw error;
+        }
+        return rows.length;
+    });
+}
+
 function base64(text) {
     const bytes = new TextEncoder().encode(text);
     let binary = '';
-    // Chunked: spreading a multi-megabyte array into String.fromCharCode blows
-    // the argument limit, and a snapshot is exactly the size that reaches it.
     for (let i = 0; i < bytes.length; i += 0x8000) {
         binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
     }

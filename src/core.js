@@ -13,8 +13,31 @@ export const SNAPSHOT_FORMAT = 1;
 export const DEFAULT_KEEP_PER_TARGET = 15;
 export const DEFAULT_MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 
-function isPlainObject(value) {
+export function isPlainObject(value) {
     return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function canonicalize(value, stack = new Set()) {
+    if (!value || typeof value !== 'object') {
+        return value;
+    }
+    if (!Array.isArray(value) && !isPlainObject(value)) {
+        return value;
+    }
+    if (stack.has(value)) {
+        throw new TypeError('Cannot serialize circular data');
+    }
+    stack.add(value);
+    const result = Array.isArray(value)
+        ? value.map(item => canonicalize(item, stack))
+        : Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalize(value[key], stack)]));
+    stack.delete(value);
+    return result;
+}
+
+/** JSON text with object keys sorted recursively and array order preserved. */
+export function canonicalJson(value) {
+    return JSON.stringify(canonicalize(value));
 }
 
 /**
@@ -58,10 +81,22 @@ export function snapshotFileName(kind, target, ts, taken = []) {
  * the version the user would later want back, which is the one failure this
  * extension exists to prevent.
  */
-export async function hashOf(value) {
-    const bytes = new TextEncoder().encode(JSON.stringify(value));
+async function hashText(text) {
+    if (!globalThis.crypto?.subtle) {
+        return null;
+    }
+    const bytes = new TextEncoder().encode(text);
     const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
     return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+export function hashOf(value) {
+    return hashText(canonicalJson(value));
+}
+
+/** Hashes snapshots written before canonical JSON was introduced. */
+export function legacyHashOf(value) {
+    return hashText(JSON.stringify(value));
 }
 
 /**
@@ -108,36 +143,67 @@ export function cardFromCharacter(character) {
  * merged element by element (`isObject` in the host's deepMerge excludes them),
  * so a snapshot with fewer tags really does shrink the list.
  *
- * ponytail: the sentinel is applied with lodash `_.unset(target, 'a.b')`, so a
- * key containing a literal dot resolves to the wrong path and is left in place.
- * Card fields never contain one; a third-party `extensions` block could. Upgrade
- * path is to report those keys as unrestorable rather than to silently miss
- * them.
+ * The sentinel is applied with lodash `_.unset(target, 'a.b')`, so removals
+ * below a literal dotted/bracketed key are refused rather than aimed at the
+ * wrong path.
  */
 export function restorePayload(live, snapshot, unsetValue) {
+    if (unsetValue === undefined) {
+        throw new Error('This SillyBunny version does not expose the character unset value');
+    }
+    if (isPlainObject(snapshot) && Object.prototype.hasOwnProperty.call(snapshot, 'avatars')) {
+        throw new Error('This card has a reserved top-level "avatars" field and cannot be restored safely');
+    }
+    rejectUnsetValue(snapshot, unsetValue);
     const payload = structuredClone(snapshot ?? {});
     markRemoved(payload, live, snapshot, unsetValue);
     return payload;
 }
 
-function markRemoved(payload, live, snapshot, unsetValue) {
+function rejectUnsetValue(value, unsetValue) {
+    if (value === unsetValue) {
+        throw new Error('This card contains SillyBunny\'s reserved unset value and cannot be restored safely');
+    }
+    if (!value || typeof value !== 'object') {
+        return;
+    }
+    for (const child of Array.isArray(value) ? value : Object.values(value)) {
+        rejectUnsetValue(child, unsetValue);
+    }
+}
+
+function markRemoved(payload, live, snapshot, unsetValue, path = [], unsafeAncestor = null) {
     if (!isPlainObject(live) || !isPlainObject(payload)) {
         return;
     }
     for (const key of Object.keys(live)) {
+        const unsafeKey = /[.[\]]/.test(key);
         if (!isPlainObject(snapshot) || !Object.prototype.hasOwnProperty.call(snapshot, key)) {
+            if (unsafeAncestor || unsafeKey) {
+                throw new Error(`The literal field "${unsafeAncestor ?? key}" cannot be removed safely by this SillyBunny version`);
+            }
             payload[key] = unsetValue;
             continue;
         }
-        if (isPlainObject(live[key]) && isPlainObject(snapshot[key])) {
-            markRemoved(payload[key], live[key], snapshot[key], unsetValue);
+        if (isPlainObject(snapshot[key])) {
+            if (!isPlainObject(live[key])) {
+                throw new Error(`The field "${[...path, key].join('.')}" cannot change from a non-object to an object safely`);
+            }
+            markRemoved(
+                payload[key],
+                live[key],
+                snapshot[key],
+                unsetValue,
+                [...path, key],
+                unsafeAncestor ?? (unsafeKey ? key : null),
+            );
         }
     }
 }
 
 /** Stable text for comparing a value against another. */
 function compareAs(value) {
-    return value === undefined ? undefined : JSON.stringify(value);
+    return value === undefined ? undefined : canonicalJson(value);
 }
 
 /**
@@ -194,7 +260,12 @@ export function diffLorebook(before, after) {
         }
     }
 
-    return { added, removed, changed };
+    const metadata = diffFields(
+        Object.fromEntries(Object.entries(isPlainObject(before) ? before : {}).filter(([key]) => key !== 'entries')),
+        Object.fromEntries(Object.entries(isPlainObject(after) ? after : {}).filter(([key]) => key !== 'entries')),
+    );
+
+    return { added, removed, changed, metadata };
 }
 
 export function entryTitle(entry) {
@@ -221,9 +292,16 @@ export function entryTitle(entry) {
  * a target with no history at all is the failure this extension exists to
  * prevent.
  */
-export function prunePlan(snapshots, { keepPerTarget = DEFAULT_KEEP_PER_TARGET, maxTotalBytes = DEFAULT_MAX_TOTAL_BYTES } = {}) {
+export function prunePlan(snapshots, {
+    keepPerTarget = DEFAULT_KEEP_PER_TARGET,
+    maxTotalBytes = DEFAULT_MAX_TOTAL_BYTES,
+    protectedIds = [],
+} = {}) {
+    keepPerTarget = Number.isFinite(keepPerTarget) ? Math.max(1, Math.floor(keepPerTarget)) : DEFAULT_KEEP_PER_TARGET;
+    maxTotalBytes = Number.isFinite(maxTotalBytes) ? Math.max(0, maxTotalBytes) : DEFAULT_MAX_TOTAL_BYTES;
     const doomed = new Set();
     const byTarget = new Map();
+    const protectedRows = new Set(protectedIds);
 
     for (const snapshot of snapshots) {
         const key = `${snapshot.kind}:${snapshot.target}`;
@@ -238,19 +316,24 @@ export function prunePlan(snapshots, { keepPerTarget = DEFAULT_KEEP_PER_TARGET, 
         list.sort((a, b) => b.ts - a.ts);
         newest.add(list[0].id);
         for (const snapshot of list.slice(keepPerTarget)) {
-            doomed.add(snapshot.id);
+            if (!protectedRows.has(snapshot.id)) {
+                doomed.add(snapshot.id);
+            }
         }
     }
 
     const survivors = snapshots
         .filter(snapshot => !doomed.has(snapshot.id))
-        .sort((a, b) => b.ts - a.ts);
+        .sort((a, b) => a.ts - b.ts);
 
-    let total = 0;
+    let total = survivors.reduce((sum, snapshot) => sum + Math.max(0, Number(snapshot.size) || 0), 0);
     for (const snapshot of survivors) {
-        total += snapshot.size ?? 0;
-        if (total > maxTotalBytes && !newest.has(snapshot.id)) {
+        if (total <= maxTotalBytes) {
+            break;
+        }
+        if (!newest.has(snapshot.id) && !protectedRows.has(snapshot.id)) {
             doomed.add(snapshot.id);
+            total -= Math.max(0, Number(snapshot.size) || 0);
         }
     }
 

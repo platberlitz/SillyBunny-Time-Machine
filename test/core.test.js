@@ -86,6 +86,13 @@ test('the hash follows the content, not the object identity', async () => {
     assert.match(a, /^[0-9a-f]{64}$/);
 });
 
+test('object key order does not change the hash', async () => {
+    assert.equal(
+        await hashOf({ nested: { a: 1, b: 2 } }),
+        await hashOf({ nested: { b: 2, a: 1 } }),
+    );
+});
+
 // --------------------------------------------------------------- restore ---
 
 test('a restore payload puts back old values and removes what was added since', () => {
@@ -122,6 +129,36 @@ test('restoring into an empty live card adds no sentinels', () => {
     assert.deepEqual(restorePayload({}, { name: 'Ren' }, UNSET), { name: 'Ren' });
 });
 
+test('unsafe character route fields and unset values are refused', () => {
+    assert.throws(() => restorePayload({}, { avatars: [] }, UNSET), /avatars/);
+    assert.throws(() => restorePayload({}, { description: UNSET }, UNSET), /reserved unset/);
+});
+
+test('a literal dotted field is refused when exact restore would remove it', () => {
+    assert.throws(() => restorePayload({ extensions: { 'vendor.setting': true } }, { extensions: {} }, UNSET), /vendor\.setting/);
+});
+
+test('removals below a literal dotted field are refused', () => {
+    assert.throws(() => restorePayload(
+        { extensions: { 'vendor.setting': { keep: true, remove: true } } },
+        { extensions: { 'vendor.setting': { keep: true } } },
+        UNSET,
+    ), /vendor\.setting/);
+});
+
+test('an existing non-object cannot be replaced with an object through the host merge', () => {
+    for (const live of [null, [], 'old', 1]) {
+        assert.throws(
+            () => restorePayload({ extension: live }, { extension: { enabled: true } }, UNSET),
+            /non-object to an object/,
+        );
+    }
+    assert.deepEqual(
+        restorePayload({}, { extension: { enabled: true } }, UNSET),
+        { extension: { enabled: true } },
+    );
+});
+
 // ------------------------------------------------------------------ diff ---
 
 test('field differences are named, in a stable order', () => {
@@ -138,6 +175,7 @@ test('field differences are named, in a stable order', () => {
 
 test('a field whose value is deeply equal is not reported as changed', () => {
     assert.deepEqual(diffFields({ a: { b: [1, 2] } }, { a: { b: [1, 2] } }), []);
+    assert.deepEqual(diffFields({ a: { x: 1, y: 2 } }, { a: { y: 2, x: 1 } }), []);
     assert.equal(diffFields({ a: { b: [1, 2] } }, { a: { b: [2, 1] } }).length, 1);
 });
 
@@ -159,6 +197,14 @@ test('entries only on one side are reported as added or removed', () => {
     );
     assert.deepEqual(added.map(e => e.title), ['Only then']);
     assert.deepEqual(removed.map(e => e.title), ['Only now']);
+});
+
+test('lorebook metadata differences are reported', () => {
+    const diff = diffLorebook(
+        { entries: {}, originalData: { name: 'Current' } },
+        { entries: {}, originalData: { name: 'Snapshot' } },
+    );
+    assert.deepEqual(diff.metadata.map(change => change.key), ['originalData']);
 });
 
 test('an entry with no title falls back to its keys', () => {
@@ -202,6 +248,24 @@ test('the byte budget never deletes the only copy of something', () => {
     ]);
     const doomed = prunePlan(snapshots, { keepPerTarget: 99, maxTotalBytes: 1 });
     assert.deepEqual(doomed, [], 'every one of these is the newest of its target');
+});
+
+test('the byte budget revisits older removable rows after protected rows', () => {
+    const snapshots = rows([
+        ['a-new', 'character', 'A.png', 3, 10],
+        ['a-old', 'character', 'A.png', 2, 80],
+        ['b-only', 'character', 'B.png', 1, 90],
+    ]);
+    assert.deepEqual(prunePlan(snapshots, { keepPerTarget: 99, maxTotalBytes: 100 }), ['a-old']);
+});
+
+test('invalid retention cannot delete the newest row and protected rows survive', () => {
+    const snapshots = rows([
+        ['new', 'character', 'A.png', 2, 10],
+        ['old', 'character', 'A.png', 1, 10],
+    ]);
+    assert.deepEqual(prunePlan(snapshots, { keepPerTarget: 0, maxTotalBytes: 100 }), ['old']);
+    assert.deepEqual(prunePlan(snapshots, { keepPerTarget: 1, maxTotalBytes: 1, protectedIds: ['old'] }), []);
 });
 
 test('nothing to prune returns nothing', () => {
