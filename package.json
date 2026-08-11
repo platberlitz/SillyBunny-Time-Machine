@@ -1,0 +1,13 @@
+{
+  "name": "sillybunny-time-machine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "lint": "node --check index.js && node --check src/core.js && node --check src/store.js && node --check src/api.js && node --check src/ui.js && node --check test/core.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
