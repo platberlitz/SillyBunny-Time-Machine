@@ -36,7 +36,7 @@
 }
 
 .sbctm-warn {
-    color: var(--warning, #d9822b);
+    color: var(--warning, #b26516);
     font-size: 0.9em;
 }
 
@@ -182,7 +182,7 @@
 }
 
 .sbctm-removed .sbctm-diff-key {
-    color: var(--warning, #d9822b);
+    color: var(--warning, #b26516);
 }
 
 .sbctm-bar {
@@ -281,6 +281,10 @@
 
     .sbctm-version {
         flex-wrap: wrap;
+    }
+
+    .sbctm-small {
+        padding: 0.55em 0.9em;
     }
 
     .sbctm-version-when {

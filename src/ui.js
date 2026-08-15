@@ -195,10 +195,9 @@ export async function openTimeMachine() {
             for (const row of inKind) {
                 const count = rows.filter(r => r.kind === row.kind && r.target === row.target).length;
                 const item = button('sbctm-target', '', () => selectTarget(row.kind, row.target));
-                item.append(
-                    el('span', 'sbctm-target-name', row.label),
-                    el('span', 'sbctm-target-meta', `${count} version${count === 1 ? '' : 's'} · ${formatWhen(row.ts)}`),
-                );
+                const meta = el('span', 'sbctm-target-meta', `${count} version${count === 1 ? '' : 's'} · ${formatWhen(row.ts)}`);
+                meta.title = new Date(row.ts).toLocaleString();
+                item.append(el('span', 'sbctm-target-name', row.label), meta);
                 if (state.selected?.kind === row.kind && state.selected?.target === row.target) {
                     item.classList.add('sbctm-target-current');
                     item.setAttribute('aria-current', 'true');
@@ -220,7 +219,9 @@ export async function openTimeMachine() {
     }
 
     function focusDetailHeading() {
-        const node = detail.querySelector('.sbctm-heading');
+        // Fall back to the empty state: deleting the last version removes the
+        // focused button, and focus must not silently drop out of the dialog.
+        const node = detail.querySelector('.sbctm-heading') ?? detail.querySelector('.sbctm-empty');
         if (node) {
             node.tabIndex = -1;
             node.focus();
@@ -241,7 +242,9 @@ export async function openTimeMachine() {
         const list = el('div', 'sbctm-timeline');
         for (const row of rows) {
             const entry = el('div', 'sbctm-version');
-            entry.append(el('span', 'sbctm-version-when', formatWhen(row.ts)));
+            const when = el('span', 'sbctm-version-when', formatWhen(row.ts));
+            when.title = new Date(row.ts).toLocaleString();
+            entry.append(when);
             entry.append(el('span', 'sbctm-version-size', formatBytes(row.size)));
             entry.append(button('menu_button sbctm-small', 'Compare', () => {
                 if (!state.restoring) {
@@ -323,7 +326,9 @@ export async function openTimeMachine() {
         }
 
         detail.replaceChildren();
-        detail.append(el('h4', 'sbctm-heading', `${row.label}: ${formatWhen(row.ts)}`));
+        const heading = el('h4', 'sbctm-heading', `${row.label}: ${formatWhen(row.ts)}`);
+        heading.title = new Date(row.ts).toLocaleString();
+        detail.append(heading);
 
         if (live === null) {
             detail.append(el('div', 'sbctm-warn',
@@ -332,16 +337,22 @@ export async function openTimeMachine() {
                     : 'This no longer exists. Restoring will create it again.'));
         }
 
-        detail.append(row.kind === 'character'
+        const diffNode = row.kind === 'character'
             ? characterDiff(live, payload)
             : row.kind === 'lorebook'
                 ? lorebookDiff(live?.data, payload.data)
-                : fieldDiff(live?.data, payload.data));
+                : fieldDiff(live?.data, payload.data);
+        detail.append(diffNode);
 
         const bar = el('div', 'sbctm-bar');
         const restore = button('menu_button', 'Restore this version', () => trackWork(confirmRestore(row, payload, restore)));
         if (row.kind === 'character' && live === null) {
             restore.disabled = true;
+        }
+        // The diff renderers return the empty-state div exactly when nothing differs.
+        if (diffNode.classList.contains('sbctm-empty')) {
+            restore.disabled = true;
+            restore.title = 'This version is identical to the current one';
         }
         bar.append(restore, button('menu_button', 'Back', () => {
             if (state.restoring) {
@@ -467,9 +478,14 @@ export async function openTimeMachine() {
             return;
         }
         state.restoring = true;
-        root.inert = true;
+        // Inert the panes, not the whole root: an inert subtree is removed from
+        // the accessibility tree, and the status live region has to keep
+        // announcing progress during the one operation that matters most.
+        body.inert = true;
+        hostSection.inert = true;
         control.disabled = true;
         let rollback = null;
+        let restored = false;
         const pinned = [];
         try {
             const ok = await confirmAction(
@@ -525,6 +541,7 @@ export async function openTimeMachine() {
             state.comparison++;
             renderTargets();
             renderTimeline();
+            restored = true;
         } catch (error) {
             console.error('[Time Machine] restore failed', error);
             if (error.partial) {
@@ -543,8 +560,14 @@ export async function openTimeMachine() {
             }
         } finally {
             state.restoring = false;
-            root.inert = false;
+            body.inert = false;
+            hostSection.inert = false;
             control.disabled = false;
+            if (restored) {
+                // Only after un-inerting: an inert pane refuses focus. The
+                // button the user pressed no longer exists on this path.
+                focusDetailHeading();
+            }
         }
     }
 
@@ -564,7 +587,8 @@ export async function openTimeMachine() {
     }
 
     // ---- the host's own settings backups ----
-    root.append(hostBackupsSection());
+    const hostSection = hostBackupsSection();
+    root.append(hostSection);
 
     renderTargets();
     renderTimeline();
@@ -603,6 +627,9 @@ function hostBackupsSection() {
     inner.append(el('div', 'sbctm-hint',
         'SillyBunny keeps rotating copies of settings.json. Only the extension block you choose is written back; tags, agents, host bookkeeping, and the rest of your settings are left alone.'));
 
+    const picker = el('div', 'sbctm-host-picker');
+    inner.append(picker);
+
     let loaded = false;
     let request = 0;
     section.addEventListener('toggle', async () => {
@@ -610,8 +637,7 @@ function hostBackupsSection() {
             return;
         }
         loaded = true;
-        const picker = el('div', 'sbctm-host-picker');
-        inner.append(picker);
+        picker.replaceChildren();
         try {
             const backups = await listHostSnapshots();
             if (backups.length === 0) {
@@ -653,7 +679,9 @@ function hostBackupsSection() {
             picker.append(selectLabel, open, parts);
         } catch (error) {
             console.error('[Time Machine] could not list backups', error);
-            picker.append(el('div', 'sbctm-empty', 'The backup list could not be read.'));
+            // Not loaded after all: reopening the section retries the fetch.
+            loaded = false;
+            picker.replaceChildren(el('div', 'sbctm-empty', 'The backup list could not be read. Close and reopen this section to retry.'));
         }
     });
 
@@ -740,7 +768,7 @@ export function renderDrawer(hostElement) {
                 settings[key] = previous;
                 box.checked = previous;
                 console.error('[Time Machine] could not save capture settings', error);
-                globalThis.toastr?.error('Time Machine settings could not be saved. Reload before trying again.');
+                globalThis.toastr?.error(settingsSaveError(error));
             } finally {
                 box.disabled = false;
             }
@@ -749,46 +777,69 @@ export function renderDrawer(hostElement) {
         hostElement.append(wrapper);
     }
 
-    const keep = el('label', 'sbctm-field');
-    keep.append(el('span', '', 'Versions kept per item'));
-    const keepInput = document.createElement('input');
-    keepInput.type = 'number';
-    keepInput.className = 'text_pole';
-    keepInput.min = '1';
-    keepInput.step = '1';
-    keepInput.value = String(settings.keepPerTarget);
-    keepInput.addEventListener('change', async () => {
-        const value = keepInput.valueAsNumber;
-        if (Number.isInteger(value) && value >= 1) {
+    hostElement.append(
+        numberField(hostElement, 'Versions kept per item', settings.keepPerTarget, (value) => {
             const previous = settings.keepPerTarget;
             settings.keepPerTarget = value;
-            keepInput.disabled = true;
-            try {
-                await commitSettings();
-            } catch (error) {
-                settings.keepPerTarget = previous;
-                keepInput.value = String(previous);
-                console.error('[Time Machine] could not apply retention settings', error);
-                globalThis.toastr?.error('The retention setting could not be saved.');
-                keepInput.disabled = false;
-                return;
-            }
-            try {
-                await prune();
-            } catch (error) {
-                console.error('[Time Machine] retention cleanup failed', error);
-                globalThis.toastr?.warning('The retention setting was saved, but some old snapshots could not be removed.');
-            }
-            renderDrawer(hostElement);
-        } else {
-            keepInput.value = String(settings.keepPerTarget);
-        }
-    });
-    keep.append(keepInput);
-    hostElement.append(keep);
+            return () => { settings.keepPerTarget = previous; };
+        }),
+        numberField(hostElement, 'Total size budget (MB)', Math.round(settings.maxTotalBytes / (1024 * 1024)), (value) => {
+            const previous = settings.maxTotalBytes;
+            settings.maxTotalBytes = value * 1024 * 1024;
+            return () => { settings.maxTotalBytes = previous; };
+        }),
+    );
 
     const used = listSnapshots().reduce((sum, row) => sum + (row.size ?? 0), 0);
     hostElement.append(el('div', 'sbctm-hint',
-        `${listSnapshots().length} snapshots, ${formatBytes(used)} of a ${formatBytes(settings.maxTotalBytes)} budget. `
+        `${listSnapshots().length} snapshots, ${formatBytes(used)} used. `
         + 'Snapshots are files on the server, so they are included in whatever backs up your SillyBunny data directory.'));
+}
+
+function settingsSaveError(error) {
+    return error?.code === 'STALE_INDEX'
+        ? 'Time Machine changed in another tab. Reload SillyBunny before changing its settings.'
+        : 'The setting could not be saved. The change was undone.';
+}
+
+/** A labelled integer setting; `apply` writes it and returns how to undo that. */
+function numberField(hostElement, label, current, apply) {
+    const field = el('label', 'sbctm-field');
+    field.append(el('span', '', label));
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.className = 'text_pole';
+    input.min = '1';
+    input.step = '1';
+    input.required = true;
+    input.value = String(current);
+    input.addEventListener('change', async () => {
+        const value = input.valueAsNumber;
+        if (!Number.isInteger(value) || value < 1) {
+            input.reportValidity();
+            input.value = String(current);
+            return;
+        }
+        const revert = apply(value);
+        input.disabled = true;
+        try {
+            await commitSettings();
+        } catch (error) {
+            revert();
+            input.value = String(current);
+            console.error('[Time Machine] could not save the setting', error);
+            globalThis.toastr?.error(settingsSaveError(error));
+            input.disabled = false;
+            return;
+        }
+        try {
+            await prune();
+        } catch (error) {
+            console.error('[Time Machine] retention cleanup failed', error);
+            globalThis.toastr?.warning('The setting was saved, but some old snapshots could not be removed.');
+        }
+        renderDrawer(hostElement);
+    });
+    field.append(input);
+    return field;
 }

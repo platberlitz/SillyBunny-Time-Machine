@@ -49,7 +49,7 @@ The index, which records which snapshot is which and how large it is, lives in e
 
 A capture is not reported as successful until its index commit can be read back from the server. Old history is pruned only after the new row is durable. Conflicting tabs in the same browser use the Web Locks API when available; a changed persisted index from another browser or device makes the operation stop and ask for a reload instead of overwriting history.
 
-Two limits keep this bounded, applied after every capture: a number of versions per item (fifteen by default), and a total size budget (50 MB). The oldest go first, and the newest version of anything is never deleted. An over-budget history is a nuisance, but an item with no history at all is the exact failure this extension exists to prevent.
+Two limits keep this bounded, applied after every capture: a number of versions per item (fifteen by default), and a total size budget (50 MB by default). Both can be changed in the extension's settings drawer. The oldest go first, and the newest version of anything is never deleted. An over-budget history is a nuisance, but an item with no history at all is the exact failure this extension exists to prevent.
 
 Snapshots are registered in the attachment map that Data Maid currently scans so it does not offer to delete them. Startup reconciliation repairs that registration from the validated index. This is a working SillyBunny 1.7 integration rather than a documented host API, so back up the whole data directory before using Data Maid after a host upgrade.
 

@@ -345,6 +345,11 @@ export function sortSnapshots(snapshots) {
     return [...snapshots].sort((a, b) => b.ts - a.ts);
 }
 
+/**
+ * Relative for the first day, absolute after. Past a day, a version is
+ * identified by its date ("was that before I broke it on the 3rd?"), and
+ * "37 days ago" makes the user do calendar arithmetic.
+ */
 export function formatWhen(ts, now = Date.now()) {
     const seconds = Math.max(0, Math.round((now - ts) / 1000));
     if (seconds < 60) {
@@ -358,8 +363,7 @@ export function formatWhen(ts, now = Date.now()) {
     if (hours < 24) {
         return `${hours} hour${hours === 1 ? '' : 's'} ago`;
     }
-    const days = Math.round(hours / 24);
-    return `${days} day${days === 1 ? '' : 's'} ago`;
+    return new Date(ts).toLocaleString();
 }
 
 export function formatBytes(value) {

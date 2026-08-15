@@ -183,7 +183,9 @@ function persistedModule(settings) {
 async function assertCurrentIndex() {
     const remoteCommit = persistedModule(await readPersistedSettings())?.lastCommit ?? '';
     if (remoteCommit !== getSettings().lastCommit) {
-        throw new Error('Time Machine changed in another tab. Reload SillyBunny before changing its history.');
+        const error = new Error('Time Machine changed in another tab. Reload SillyBunny before changing its history.');
+        error.code = 'STALE_INDEX';
+        throw error;
     }
 }
 

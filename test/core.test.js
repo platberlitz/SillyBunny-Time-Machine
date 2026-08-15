@@ -6,6 +6,7 @@ import {
     diffFields,
     diffLorebook,
     entryTitle,
+    formatWhen,
     hashOf,
     prunePlan,
     restorePayload,
@@ -270,4 +271,15 @@ test('invalid retention cannot delete the newest row and protected rows survive'
 
 test('nothing to prune returns nothing', () => {
     assert.deepEqual(prunePlan([], {}), []);
+});
+
+// ------------------------------------------------------------- formatting ---
+
+test('timestamps are relative for the first day and absolute after', () => {
+    const now = 1700000000000;
+    assert.equal(formatWhen(now - 30 * 1000, now), 'just now');
+    assert.equal(formatWhen(now - 5 * 60 * 1000, now), '5 minutes ago');
+    assert.equal(formatWhen(now - 3 * 60 * 60 * 1000, now), '3 hours ago');
+    const old = now - 40 * 24 * 60 * 60 * 1000;
+    assert.equal(formatWhen(old, now), new Date(old).toLocaleString());
 });
