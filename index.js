@@ -48,6 +48,10 @@ function guard(promise, label = 'automatic snapshot') {
 
 function warn(message, error) {
     console.error(`[Time Machine] ${message}`, error ?? '');
+    // Unconfirmed is not failed: the row stays indexed and the pending flush lands it.
+    if (error?.code === 'COMMIT_UNCONFIRMED') {
+        return;
+    }
     const now = Date.now();
     if (now - lastWarningAt >= 60_000) {
         lastWarningAt = now;

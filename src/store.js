@@ -244,6 +244,19 @@ async function commitNow() {
         changed = waitForSettingsUpdate(Math.min(500, Math.max(0, deadline - Date.now())));
     }
 
+    // One last read before declaring failure: the write may have landed without
+    // the update event or an earlier read having caught it. Rolling the token
+    // back when the file already carries it would desync this tab and fail
+    // every later capture with STALE_INDEX.
+    try {
+        if (persistedModule(await readPersistedSettings())?.lastCommit === expected) {
+            needsRepair = false;
+            return;
+        }
+    } catch (error) {
+        lastError = error;
+    }
+
     if (settings.lastCommit === expected) {
         settings.lastCommit = previous;
     }

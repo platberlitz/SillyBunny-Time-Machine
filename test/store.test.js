@@ -201,12 +201,11 @@ test('snapshots written with the legacy JSON hash still load', async () => {
 
 test('an unconfirmed commit keeps a possibly indexed blob and row', async () => {
     const originalNow = Date.now;
+    const originalSave = context.saveSettingsDebounced;
     let now = 1_000;
     Date.now = () => now;
     context.saveSettingsDebounced = () => {
-        persisted = structuredClone(context.extensionSettings);
         now = 20_000;
-        queueMicrotask(() => context.eventSource.emit('settings_updated'));
     };
     try {
         await assert.rejects(
@@ -215,11 +214,37 @@ test('an unconfirmed commit keeps a possibly indexed blob and row', async () => 
         );
     } finally {
         Date.now = originalNow;
+        context.saveSettingsDebounced = originalSave;
+    }
+
+    assert.equal(listSnapshots().length, 1);
+    assert.equal(persisted[MODULE_NAME], undefined);
+    assert.equal(files.size, 1);
+
+    await save({ kind: 'character', target: 'Quinn.png', label: 'Quinn', data: { name: 'Quinn' } });
+    assert.equal(listSnapshots().length, 2);
+    assert.equal(persisted[MODULE_NAME].snapshots.length, 2);
+    assert.equal(files.size, 2);
+});
+
+test('a commit that landed without an update event confirms on the final read', async () => {
+    const originalNow = Date.now;
+    let now = 1_000;
+    Date.now = () => now;
+    context.saveSettingsDebounced = () => {
+        persisted = structuredClone(context.extensionSettings);
+        now = 20_000;
+    };
+    try {
+        const row = await save({ kind: 'character', target: 'Ren.png', label: 'Ren', data: { name: 'Ren' } });
+        assert.equal(row.kind, 'character');
+    } finally {
+        Date.now = originalNow;
     }
 
     assert.equal(listSnapshots().length, 1);
     assert.equal(persisted[MODULE_NAME].snapshots.length, 1);
-    assert.equal(files.size, 1);
+    assert.equal(getSettings().lastCommit, persisted[MODULE_NAME].lastCommit);
 });
 
 test('a synchronous settings failure restores the local commit token', async () => {
