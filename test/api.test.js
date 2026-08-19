@@ -67,15 +67,15 @@ test.beforeEach(() => {
             });
         }
         if (url === '/api/files/upload') {
-            const path = `/files/${body.name}`;
+            const path = `/user/files/${body.name}`;
             files.set(path, Buffer.from(body.data, 'base64').toString('utf8'));
-            return jsonResponse({ path: path.slice(1) });
+            return jsonResponse({ path });
         }
         if (url === '/api/files/delete') {
             files.delete(body.path);
             return new Response('', { status: 200 });
         }
-        if (typeof url === 'string' && url.startsWith('/files/')) {
+        if (typeof url === 'string' && url.startsWith('/user/files/')) {
             return files.has(url)
                 ? new Response(files.get(url), { status: 200 })
                 : new Response('', { status: 404 });

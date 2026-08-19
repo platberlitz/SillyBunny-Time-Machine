@@ -1,7 +1,7 @@
 {
     "display_name": "Card & Lorebook Time Machine",
     "author": "platberlitz",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "description": "Automatic snapshots of characters, lorebooks and presets, with a comparison view and one-click restore. Nothing in SillyBunny backs those three up.",
     "requires": [],
     "optional": [],

@@ -23,6 +23,7 @@ let persisted;
 let files;
 let requests;
 let deleteStatus;
+let uploadResponsePath;
 
 function jsonResponse(value, status = 200) {
     return new Response(JSON.stringify(value), {
@@ -37,6 +38,7 @@ test.beforeEach(() => {
     files = new Map();
     requests = [];
     deleteStatus = null;
+    uploadResponsePath = null;
     context = {
         extensionSettings: {},
         eventSource: events,
@@ -55,10 +57,10 @@ test.beforeEach(() => {
         }
         if (url === '/api/files/upload') {
             const body = JSON.parse(options.body);
-            const path = `/files/${body.name}`;
+            const path = `/user/files/${body.name}`;
             files.set(path, Buffer.from(body.data, 'base64').toString('utf8'));
             requests.push(`upload:${body.name}`);
-            return jsonResponse({ path: path.slice(1) });
+            return jsonResponse({ path: uploadResponsePath ?? path });
         }
         if (url === '/api/files/delete') {
             const { path } = JSON.parse(options.body);
@@ -71,7 +73,7 @@ test.beforeEach(() => {
             }
             return new Response('', { status: 200 });
         }
-        if (typeof url === 'string' && url.startsWith('/files/')) {
+        if (typeof url === 'string' && url.startsWith('/user/files/')) {
             return files.has(url)
                 ? new Response(files.get(url), { status: 200, headers: { 'content-type': 'application/json' } })
                 : new Response('', { status: 404 });
@@ -103,13 +105,25 @@ test('a new index is committed before retention deletes the old file', async () 
     assert.ok(upload < durable && durable < deletion, requests.join('\n'));
 });
 
+test('accepts the host upload path and rejects a different filename', async () => {
+    const row = await save({ kind: 'character', target: 'Ren.png', label: 'Ren', data: { name: 'Ren' } });
+    assert.equal(row.url, `/user/files/${row.name}`);
+
+    uploadResponsePath = '/user/files/different-name.json';
+    await assert.rejects(
+        save({ kind: 'character', target: 'Quinn.png', label: 'Quinn', data: { name: 'Quinn' } }),
+        /unexpected snapshot path/,
+    );
+    assert.equal(listSnapshots().length, 1);
+});
+
 test('an untrusted file path is quarantined and never deleted', async () => {
     context.extensionSettings[MODULE_NAME] = {
         ...getSettings(),
         snapshots: [{
             id: 'bad', kind: 'character', target: 'Ren.png', label: 'Ren',
             ts: 1, size: 1, hash: '0'.repeat(64),
-            name: 'cardtm_character_Ren_1.json', url: '/files/important.txt',
+            name: 'cardtm_character_Ren_1.json', url: '/user/files/important.txt',
         }],
     };
     persisted = structuredClone(context.extensionSettings);
@@ -190,7 +204,7 @@ test('snapshots written with the legacy JSON hash still load', async () => {
         size: new TextEncoder().encode(text).length,
         hash: await legacyHashOf(data),
         name,
-        url: `/files/${name}`,
+        url: `/user/files/${name}`,
     };
     context.extensionSettings[MODULE_NAME] = { ...getSettings(), snapshots: [row] };
     persisted = structuredClone(context.extensionSettings);

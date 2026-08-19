@@ -40,7 +40,7 @@ function uniqueToken() {
 }
 
 function canonicalUrl(name) {
-    return `/files/${name}`;
+    return `/user/files/${name}`;
 }
 
 function normalUrl(url) {
