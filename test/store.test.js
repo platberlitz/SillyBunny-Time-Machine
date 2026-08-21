@@ -241,6 +241,34 @@ test('an unconfirmed commit keeps a possibly indexed blob and row', async () => 
     assert.equal(files.size, 2);
 });
 
+test('a commit that lands after timeout is reconciled on the next save', async () => {
+    const originalNow = Date.now;
+    const originalSave = context.saveSettingsDebounced;
+    let delayed;
+    let now = 1_000;
+    Date.now = () => now;
+    context.saveSettingsDebounced = () => {
+        delayed = structuredClone(context.extensionSettings);
+        now = 20_000;
+    };
+    try {
+        await assert.rejects(
+            save({ kind: 'character', target: 'Ren.png', label: 'Ren', data: { name: 'Ren' } }),
+            error => error.code === 'COMMIT_UNCONFIRMED',
+        );
+    } finally {
+        Date.now = originalNow;
+        context.saveSettingsDebounced = originalSave;
+    }
+
+    persisted = delayed;
+    await save({ kind: 'character', target: 'Quinn.png', label: 'Quinn', data: { name: 'Quinn' } });
+
+    assert.deepEqual(listSnapshots().map(row => row.target), ['Ren.png', 'Quinn.png']);
+    assert.equal(persisted[MODULE_NAME].snapshots.length, 2);
+    assert.equal(files.size, 2);
+});
+
 test('a commit that landed without an update event confirms on the final read', async () => {
     const originalNow = Date.now;
     let now = 1_000;

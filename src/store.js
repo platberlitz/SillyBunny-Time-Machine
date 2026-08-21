@@ -72,6 +72,7 @@ function normalizeRow(value) {
 
 let needsRepair = false;
 const protectedSnapshotIds = new Set();
+const unconfirmedCommits = new Set();
 
 export function getSettings() {
     const container = ctx().extensionSettings;
@@ -181,8 +182,13 @@ function persistedModule(settings) {
 }
 
 async function assertCurrentIndex() {
-    const remoteCommit = persistedModule(await readPersistedSettings())?.lastCommit ?? '';
-    if (remoteCommit !== getSettings().lastCommit) {
+    const remoteValue = persistedModule(await readPersistedSettings())?.lastCommit;
+    const remoteCommit = typeof remoteValue === 'string' ? remoteValue : '';
+    const settings = getSettings();
+    if (remoteCommit !== settings.lastCommit && unconfirmedCommits.delete(remoteCommit)) {
+        // A timed-out save from this page landed after its local token was rolled back.
+        settings.lastCommit = remoteCommit;
+    } else if (remoteCommit !== settings.lastCommit) {
         const error = new Error('Time Machine changed in another tab. Reload SillyBunny before changing its history.');
         error.code = 'STALE_INDEX';
         throw error;
@@ -235,6 +241,7 @@ async function commitNow() {
         await changed;
         try {
             if (persistedModule(await readPersistedSettings())?.lastCommit === expected) {
+                unconfirmedCommits.clear();
                 needsRepair = false;
                 return;
             }
@@ -250,6 +257,7 @@ async function commitNow() {
     // every later capture with STALE_INDEX.
     try {
         if (persistedModule(await readPersistedSettings())?.lastCommit === expected) {
+            unconfirmedCommits.clear();
             needsRepair = false;
             return;
         }
@@ -257,6 +265,7 @@ async function commitNow() {
         lastError = error;
     }
 
+    unconfirmedCommits.add(expected);
     if (settings.lastCommit === expected) {
         settings.lastCommit = previous;
     }
