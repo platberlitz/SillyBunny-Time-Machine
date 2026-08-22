@@ -9,14 +9,6 @@
     margin: 0;
 }
 
-#sbctm-settings-drawer > .inline-drawer-toggle {
-    width: 100%;
-    border: 0;
-    color: inherit;
-    font: inherit;
-    text-align: left;
-}
-
 .sbctm-actions {
     display: flex;
     align-items: center;

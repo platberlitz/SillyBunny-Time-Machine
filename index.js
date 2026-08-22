@@ -204,11 +204,10 @@ function ensureDrawer() {
         drawer.id = DRAWER_ID;
         drawer.className = 'inline-drawer';
 
-        const toggle = document.createElement('button');
-        toggle.type = 'button';
+        // Plain <div>, exactly like every host drawer header: a <button> would
+        // need a font/colour reset that outranks theme rules on .inline-drawer-header.
+        const toggle = document.createElement('div');
         toggle.className = 'inline-drawer-toggle inline-drawer-header';
-        toggle.setAttribute('aria-expanded', 'false');
-        toggle.setAttribute('aria-controls', `${DRAWER_ID}-content`);
         const title = document.createElement('b');
         title.textContent = 'Time Machine';
         const chevron = document.createElement('div');
@@ -218,9 +217,6 @@ function ensureDrawer() {
         const content = document.createElement('div');
         content.id = `${DRAWER_ID}-content`;
         content.className = 'inline-drawer-content';
-        toggle.addEventListener('click', () => {
-            toggle.setAttribute('aria-expanded', String(toggle.getAttribute('aria-expanded') !== 'true'));
-        });
         drawer.append(toggle, content);
         host.append(drawer);
     }
